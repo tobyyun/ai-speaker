@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ollama-voice-assistant"
-version = "0.1.0"
-description = "A hands-free Python voice assistant that runs 100% locally with Ollama."
+name = "ai-speaker"
+version = "0.2.0"
+description = "A multi-provider AI voice assistant with pluggable LLM, TTS, and STT backends."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
@@ -25,12 +25,28 @@ dependencies = [
     "psutil",
     "scipy",
     "requests",
+    "python-dotenv>=1.0.0",
+    "supertonic",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest",
     "unittest-xml-reporting",
+]
+claude = [
+    "anthropic>=0.40.0",
+]
+openai = [
+    "openai>=1.50.0",
+]
+supertonic = [
+    "supertonic",
+]
+all-providers = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "supertonic",
 ]
 
 [project.scripts]

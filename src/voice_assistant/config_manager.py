@@ -16,8 +16,16 @@ import argparse
 import logging
 import sys
 import os
-import ollama
 from typing import Any, Tuple, Optional
+
+# python-dotenv 통합: .env 파일에서 API 키 로딩
+try:
+    from dotenv import load_dotenv
+    _dotenv_loaded = load_dotenv()
+    if not _dotenv_loaded:
+        logging.warning(".env 파일을 찾을 수 없습니다. API 키가 필요한 클라우드 Provider는 사용할 수 없습니다.")
+except ImportError:
+    logging.warning("python-dotenv가 설치되지 않았습니다. .env 파일 로딩을 건너뜁니다.")
 
 # Import defaults and helpers from audio_utils
 try:
@@ -86,17 +94,25 @@ def sanitize_file_path(file_path: str, description: str = "file") -> str:
             
     return abs_path
 
-def get_ollama_client(ollama_host: str) -> Optional[ollama.Client]:
-    """
-    Tries to connect to the Ollama server and returns a client instance.
-    Returns None if the connection fails.
+def get_ollama_client(ollama_host: str) -> Optional[Any]:
+    """Ollama 클라이언트를 생성하여 반환.
+
+    DEPRECATED: 이 함수는 하위 호환성을 위해 유지됩니다.
+    새 코드에서는 ProviderFactory.create_llm()을 사용하세요.
+
+    Returns:
+        ollama.Client 인스턴스 또는 연결 실패 시 None
     """
     logging.info(f"Attempting to connect to Ollama at {ollama_host}...")
     try:
+        import ollama
         client = ollama.Client(host=ollama_host)
         client.list()
         logging.info("Ollama server connection successful.")
         return client
+    except ImportError:
+        logging.error("ollama 패키지가 설치되지 않았습니다.")
+        return None
     except Exception as e:
         logging.error(f"Failed to connect to Ollama at {ollama_host}: {e}")
         logging.warning("Please ensure Ollama is running and the 'ollama_host' in config.ini is correct.")
@@ -132,6 +148,7 @@ def load_config_and_args() -> Tuple[argparse.Namespace, configparser.ConfigParse
     config_models = config['Models'] if 'Models' in config else {}
     config_func = config['Functionality'] if 'Functionality' in config else {}
     config_perf = config['Performance'] if 'Performance' in config else {}
+    config_providers = config['Providers'] if 'Providers' in config else {}
 
     def get_config_val(section: configparser.SectionProxy, key: str, default: Any, type_converter: type) -> Any:
         if not config_loaded:
@@ -205,6 +222,12 @@ def load_config_and_args() -> Tuple[argparse.Namespace, configparser.ConfigParse
     func_group.add_argument('--audio-buffer-size', type=int, help="Size of the audio buffer queue.")
     func_group.add_argument('--trim-wake-word', action='store_true', help="Enable trimming the wake word from the start of transcription.")
 
+    provider_group = parser.add_argument_group('Providers')
+    provider_group.add_argument('--llm-provider', type=str, help="LLM provider name (e.g., ollama, claude, openai).")
+    provider_group.add_argument('--tts-provider', type=str, help="TTS provider name (e.g., piper, openai).")
+    provider_group.add_argument('--stt-provider', type=str, help="STT provider name (e.g., whisper, openai).")
+    provider_group.add_argument('--default-language', type=str, help="Default language code (e.g., ko, en).")
+
     perf_group = parser.add_argument_group('Performance')
     perf_group.add_argument('--gc-interval', type=int, help="Force garbage collection every N conversations.")
     perf_group.add_argument('--memory-profiling', action='store_true', help="Enable memory profiling in debug mode.")
@@ -236,7 +259,11 @@ def load_config_and_args() -> Tuple[argparse.Namespace, configparser.ConfigParse
         audio_buffer_size=get_config_val(config_func, 'audio_buffer_size', DEFAULT_SETTINGS['audio_buffer_size'], int),
         trim_wake_word=get_config_val(config_func, 'trim_wake_word', DEFAULT_SETTINGS['trim_wake_word'], bool),
         gc_interval=get_config_val(config_perf, 'gc_interval', DEFAULT_SETTINGS['gc_interval'], int),
-        memory_profiling=get_config_val(config_perf, 'memory_profiling', DEFAULT_SETTINGS['memory_profiling'], bool)
+        memory_profiling=get_config_val(config_perf, 'memory_profiling', DEFAULT_SETTINGS['memory_profiling'], bool),
+        llm_provider=get_config_val(config_providers, 'llm_provider', DEFAULT_SETTINGS['llm_provider'], str),
+        tts_provider=get_config_val(config_providers, 'tts_provider', DEFAULT_SETTINGS['tts_provider'], str),
+        stt_provider=get_config_val(config_providers, 'stt_provider', DEFAULT_SETTINGS['stt_provider'], str),
+        default_language=get_config_val(config_providers, 'default_language', DEFAULT_SETTINGS['default_language'], str),
     )
 
     args = parser.parse_args()

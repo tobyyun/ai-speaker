@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API
 # --- IMPROVEMENT: Top-Level Dependency Check ---
 # Encapsulate critical imports to provide clear error messages if dependencies are missing.
 try:
-    from .config_manager import load_config_and_args, get_ollama_client
+    from .config_manager import load_config_and_args
     from .voice_assistant import VoiceAssistant
 except ImportError as e:
     print(
@@ -55,32 +55,24 @@ def main() -> None:
 
     args, _, should_exit = load_config_and_args()
 
-    # --- Log key settings ---
-    logging.info(f"Using Ollama model: {args.ollama_model}")
-    logging.info(f"Using Whisper model: {args.whisper_model} on {args.whisper_device}")
+    # --- 주요 설정 로깅 ---
+    logging.info(f"LLM Provider: {args.llm_provider}")
+    logging.info(f"TTS Provider: {args.tts_provider}")
+    logging.info(f"STT Provider: {args.stt_provider}")
     logging.info(f"Trim wake word from transcription: {'Enabled' if args.trim_wake_word else 'Disabled'}")
     # ---
 
-    # Optional detailed memory tracing
+    # 상세 메모리 트레이싱 (디버그 모드)
     if args.debug:
         tracemalloc.start()
 
     assistant: VoiceAssistant | None = None
     try:
-        # Handle device listing exit flag
+        # 장치 목록 출력 후 종료 플래그 처리
         if should_exit:
-            # config_manager has already printed the device list.
             sys.exit(0)
 
-        # Get the Ollama client *once* and pass it to the assistant.
-        ollama_client = get_ollama_client(args.ollama_host)
-
-        if ollama_client is None:
-            logging.warning(
-                "Ollama server not reachable. Assistant will run but cannot respond."
-            )
-
-        assistant = VoiceAssistant(args, ollama_client)
+        assistant = VoiceAssistant(args)
 
         assistant.run()
 

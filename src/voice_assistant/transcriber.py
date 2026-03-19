@@ -43,10 +43,12 @@ class Transcriber:
         logging.debug(f"Starting Whisper transcription (audio length: {len(audio_np)} samples, {len(audio_np)/16000:.2f}s)")
         
         try:
+            # 언어 설정: config에서 default_language를 읽거나 기본값 'ko' 사용
+            transcribe_language = getattr(self.args, "default_language", "ko")
             segments, info = self.model.transcribe(
-                audio_np, 
-                language="en",
-                vad_filter=False,  # We've already done VAD
+                audio_np,
+                language=transcribe_language,
+                vad_filter=False,  # 이미 VAD를 수행했으므로 비활성화
                 condition_on_previous_text=True,
                 log_prob_threshold=None,
                 compression_ratio_threshold=None

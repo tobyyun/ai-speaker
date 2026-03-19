@@ -19,7 +19,7 @@ DEFAULT_AUDIO_BUFFER_SIZE: int = 200
 # --- 2. Centralized Configuration Defaults ---
 DEFAULT_SETTINGS: dict[str, Any] = {
     'ollama_model': 'llama3',
-    'whisper_model': 'base.en',
+    'whisper_model': 'small',
     'wakeword_model_path': 'models/hey_jarvis_v2.onnx',
     'piper_model_path': 'models/en_US-lessac-medium.onnx',
     'ollama_host': 'http://localhost:11434',
@@ -29,14 +29,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'silence_seconds': 0.3,
     'listen_timeout': 4.0,
     'pre_buffer_ms': 400,
-    'system_prompt': 'You are a friendly, concise, and intelligent voice assistant named Jarvis. Keep your responses short and witty.',
+    'system_prompt': '당신은 똑똑하고 재치 있는 한국어 음성 비서입니다. 모든 응답은 간결하게 한두 문장으로 해주세요. 정확하고 유용한 정보를 제공하되 짧게 말해주세요.',
     'device_index': None,
     'piper_output_device_index': None,
     'max_words_per_command': 60,
     'whisper_device': 'cpu',
     'whisper_compute_type': 'int8',
-    'whisper_avg_logprob': -1.0,
-    'whisper_no_speech_prob': 0.6,
+    'whisper_avg_logprob': -1.2,
+    'whisper_no_speech_prob': 0.7,
     'max_history_tokens': 2048,
     'audio_buffer_size': DEFAULT_AUDIO_BUFFER_SIZE,  # FIX #2: Added buffer size config
     'gc_interval': 10,
@@ -44,6 +44,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'trim_wake_word': True,
     'max_phrase_duration': 15.0,
     'gain': 1.0,
+    # Provider 설정 기본값
+    'llm_provider': 'claude',
+    'tts_provider': 'supertonic',
+    'stt_provider': 'whisper',
+    'default_language': 'ko',
+    'supertonic_voice': 'F3',
 }       
 
 # --- 3. Audio Helpers (Updated for sounddevice) ---

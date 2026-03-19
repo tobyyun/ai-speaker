@@ -7,33 +7,36 @@ import os
 import gc
 import re
 
-# Import our new modules
+# 서브모듈 임포트
 from .audio_input import AudioInput
-from .transcriber import Transcriber
-from .synthesizer import Synthesizer
-from .llm_handler import LLMHandler
+from .providers import ProviderFactory
 from .audio_utils import SENTENCE_END_PUNCTUATION, monitor_memory
 
 class VoiceAssistant:
-    def __init__(self, args, client):
+    def __init__(self, args, client=None):
         self.args = args
         self.interrupt_event = threading.Event()
         self.conversation_count = 0
         self.is_handling_conversation = False
-        
-        # Wake word detection improvements
+
+        # 웨이크워드 감지 개선
         self.last_wakeword_time = 0
         self.wakeword_cooldown = 1.0  # Reduced from 1.5s
         self.consecutive_detection_count = 0
         self.required_consecutive = 2  # Confirmations needed
-        
+
         logging.debug(f"VoiceAssistant init - cooldown: {self.wakeword_cooldown}s, required consecutive: {self.required_consecutive}")
-        
-        # Initialize Subsystems
+
+        # 서브시스템 초기화 (Provider 팩토리를 통해 생성)
         self.audio = AudioInput(args)
-        self.transcriber = Transcriber(args)
-        self.tts = Synthesizer(args, self.interrupt_event)
-        self.llm = LLMHandler(client, args)
+
+        llm_provider_name = getattr(args, "llm_provider", "ollama")
+        tts_provider_name = getattr(args, "tts_provider", "piper")
+        stt_provider_name = getattr(args, "stt_provider", "whisper")
+
+        self.transcriber = ProviderFactory.create_stt(stt_provider_name, args)
+        self.tts = ProviderFactory.create_tts(tts_provider_name, args, self.interrupt_event)
+        self.llm = ProviderFactory.create_llm(llm_provider_name, args)
 
         # Wakeword Setup
         if not os.path.exists(args.wakeword_model_path):
@@ -149,7 +152,7 @@ class VoiceAssistant:
             
             logging.debug("Playing acknowledgment")
             self.tts.speak("Yes?")
-            self.tts.queue.join()
+            self.tts.wait_until_done()
             
             self.interrupt_event.clear()
             
@@ -240,7 +243,7 @@ class VoiceAssistant:
             if "exit" in user_text_lower or "goodbye" in user_text_lower:
                 logging.debug("Exit command detected")
                 self.tts.speak("Goodbye.")
-                self.tts.queue.join()
+                self.tts.wait_until_done()
                 exit(0)
     
             # Check for history reset commands
@@ -248,7 +251,7 @@ class VoiceAssistant:
                 logging.debug("Chat reset command detected")
                 self.llm.reset_history()
                 self.tts.speak("Chat history cleared.")
-                self.tts.queue.join()
+                self.tts.wait_until_done()
                 self.audio.start()
                 return
     
@@ -287,7 +290,7 @@ class VoiceAssistant:
                 self.tts.speak(sentence_buffer.strip())
             
             logging.debug("Waiting for TTS to complete")
-            self.tts.queue.join()
+            self.tts.wait_until_done()
             
             # After conversation completes
             self.conversation_count += 1
@@ -415,8 +418,11 @@ class VoiceAssistant:
         return text
 
     def cleanup(self):
+        """모든 서브시스템 리소스 정리."""
         logging.debug("Starting cleanup")
         self.audio.stop()
         self.tts.stop()
         self.transcriber.close()
+        if hasattr(self, 'llm') and self.llm is not None:
+            self.llm.close()
         logging.debug("Cleanup complete")
