@@ -21,7 +21,7 @@ from typing import Any, Tuple, Optional
 # python-dotenv 통합: .env 파일에서 API 키 로딩
 try:
     from dotenv import load_dotenv
-    _dotenv_loaded = load_dotenv()
+    _dotenv_loaded = load_dotenv(override=True)
     if not _dotenv_loaded:
         logging.warning(".env 파일을 찾을 수 없습니다. API 키가 필요한 클라우드 Provider는 사용할 수 없습니다.")
 except ImportError:
@@ -240,6 +240,8 @@ def load_config_and_args() -> Tuple[argparse.Namespace, configparser.ConfigParse
         piper_model_path=get_config_val(config_models, 'piper_model_path', DEFAULT_SETTINGS['piper_model_path'], str),
         ollama_host=get_config_val(config_models, 'ollama_host', DEFAULT_SETTINGS['ollama_host'], str),
         wakeword=get_config_val(config_func, 'wakeword', DEFAULT_SETTINGS['wakeword'], str),
+        wakeword_mode=get_config_val(config_func, 'wakeword_mode', DEFAULT_SETTINGS['wakeword_mode'], str),
+        follow_up_seconds=get_config_val(config_func, 'follow_up_seconds', DEFAULT_SETTINGS['follow_up_seconds'], float),
         wakeword_threshold=get_config_val(config_func, 'wakeword_threshold', DEFAULT_SETTINGS['wakeword_threshold'], float),
         vad_aggressiveness=get_config_val(config_func, 'vad_aggressiveness', DEFAULT_SETTINGS['vad_aggressiveness'], int),
         silence_seconds=get_config_val(config_func, 'silence_seconds', DEFAULT_SETTINGS['silence_seconds'], float),
@@ -264,6 +266,10 @@ def load_config_and_args() -> Tuple[argparse.Namespace, configparser.ConfigParse
         tts_provider=get_config_val(config_providers, 'tts_provider', DEFAULT_SETTINGS['tts_provider'], str),
         stt_provider=get_config_val(config_providers, 'stt_provider', DEFAULT_SETTINGS['stt_provider'], str),
         default_language=get_config_val(config_providers, 'default_language', DEFAULT_SETTINGS['default_language'], str),
+        supertone_voice_id=get_config_val(config_providers, 'supertone_voice_id', DEFAULT_SETTINGS['supertone_voice_id'], str),
+        supertone_model=get_config_val(config_providers, 'supertone_model', DEFAULT_SETTINGS['supertone_model'], str),
+        supertone_style=get_config_val(config_providers, 'supertone_style', DEFAULT_SETTINGS['supertone_style'], str),
+        grok_tts_voice=get_config_val(config_providers, 'grok_tts_voice', DEFAULT_SETTINGS.get('grok_tts_voice', 'sal'), str),
     )
 
     args = parser.parse_args()

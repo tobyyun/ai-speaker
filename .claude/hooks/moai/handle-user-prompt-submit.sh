@@ -10,6 +10,16 @@ trap 'rm -f "$temp_file"' EXIT
 # Read stdin into temp file
 cat > "$temp_file"
 
+# 프롬프트 로그 저장
+LOG_DIR="$CLAUDE_PROJECT_DIR/.moai/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/prompt-log.jsonl"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+PROMPT=$(cat "$temp_file" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('prompt',''))" 2>/dev/null)
+if [ -n "$PROMPT" ]; then
+    printf '{"ts":"%s","prompt":"%s"}\n' "$TIMESTAMP" "$(echo "$PROMPT" | head -c 2000 | sed 's/"/\\"/g' | tr '\n' ' ')" >> "$LOG_FILE"
+fi
+
 # Try moai command in PATH
 if command -v moai &> /dev/null; then
 	exec moai hook user-prompt-submit < "$temp_file"

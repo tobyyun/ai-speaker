@@ -23,7 +23,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'wakeword_model_path': 'models/hey_jarvis_v2.onnx',
     'piper_model_path': 'models/en_US-lessac-medium.onnx',
     'ollama_host': 'http://localhost:11434',
-    'wakeword': 'hey jarvis',
+    'wakeword': '챱츄야',
+    'wakeword_mode': 'stt',
+    'follow_up_seconds': 10,
     'wakeword_threshold': 0.35,
     'vad_aggressiveness': 2,
     'silence_seconds': 0.3,
@@ -50,7 +52,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'stt_provider': 'whisper',
     'default_language': 'ko',
     'supertonic_voice': 'F3',
-}       
+    'supertone_voice_id': '',
+    'supertone_model': 'sona_speech_2_flash',
+    'supertone_style': 'neutral',
+}
 
 # --- 3. Audio Helpers (Updated for sounddevice) ---
 def list_audio_input_devices() -> None:

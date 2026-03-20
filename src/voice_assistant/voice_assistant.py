@@ -2,7 +2,6 @@ import logging
 import threading
 import time
 import numpy as np
-from openwakeword.model import Model
 import os
 import gc
 import re
@@ -10,7 +9,7 @@ import re
 # 서브모듈 임포트
 from .audio_input import AudioInput
 from .providers import ProviderFactory
-from .audio_utils import SENTENCE_END_PUNCTUATION, monitor_memory
+from .audio_utils import SENTENCE_END_PUNCTUATION, RATE, INT16_MAX, monitor_memory
 
 class VoiceAssistant:
     def __init__(self, args, client=None):
@@ -19,13 +18,19 @@ class VoiceAssistant:
         self.conversation_count = 0
         self.is_handling_conversation = False
 
-        # 웨이크워드 감지 개선
+        # 웨이크워드 감지 설정
         self.last_wakeword_time = 0
-        self.wakeword_cooldown = 1.0  # Reduced from 1.5s
+        self.wakeword_cooldown = 1.0
         self.consecutive_detection_count = 0
-        self.required_consecutive = 2  # Confirmations needed
+        self.required_consecutive = 1
 
-        logging.debug(f"VoiceAssistant init - cooldown: {self.wakeword_cooldown}s, required consecutive: {self.required_consecutive}")
+        # 웨이크워드 모드: "model" (OpenWakeWord ONNX) 또는 "stt" (STT 기반)
+        self.wakeword_mode = getattr(args, "wakeword_mode", "model")
+        # STT 모드에서 매칭할 웨이크워드
+        self.wakeword_text = getattr(args, "wakeword", "hey jarvis").strip()
+        self.wakeword_chosung = self._extract_chosung(self.wakeword_text)
+
+        logging.debug(f"VoiceAssistant init - wakeword_mode: {self.wakeword_mode}, wakeword: '{self.wakeword_text}', chosung: '{self.wakeword_chosung}'")
 
         # 서브시스템 초기화 (Provider 팩토리를 통해 생성)
         self.audio = AudioInput(args)
@@ -38,95 +43,292 @@ class VoiceAssistant:
         self.tts = ProviderFactory.create_tts(tts_provider_name, args, self.interrupt_event)
         self.llm = ProviderFactory.create_llm(llm_provider_name, args)
 
-        # Wakeword Setup
-        if not os.path.exists(args.wakeword_model_path):
-            raise FileNotFoundError(f"Wakeword model missing: {args.wakeword_model_path}")
-        
-        logging.debug(f"Loading wakeword model from: {args.wakeword_model_path}")
-        self.oww_model = Model(wakeword_model_paths=[args.wakeword_model_path])
-        self.wakeword_key = list(self.oww_model.models.keys())[0]
-        logging.debug(f"Wakeword model loaded with key: {self.wakeword_key}")
+        # Wakeword Setup (model 모드에서만 ONNX 모델 로드)
+        self.oww_model = None
+        self.wakeword_key = None
+        if self.wakeword_mode == "model":
+            try:
+                from openwakeword.model import Model
+                if not os.path.exists(args.wakeword_model_path):
+                    raise FileNotFoundError(f"Wakeword model missing: {args.wakeword_model_path}")
+                logging.debug(f"Loading wakeword model from: {args.wakeword_model_path}")
+                self.oww_model = Model(wakeword_model_paths=[args.wakeword_model_path])
+                self.wakeword_key = list(self.oww_model.models.keys())[0]
+                logging.debug(f"Wakeword model loaded with key: {self.wakeword_key}")
+            except Exception as e:
+                logging.warning(f"OpenWakeWord 모델 로드 실패, STT 모드로 전환: {e}")
+                self.wakeword_mode = "stt"
+
+        if self.wakeword_mode == "stt":
+            logging.info(f"STT 기반 웨이크워드 모드. 웨이크워드: '{self.wakeword_text}'")
 
     def run(self):
         logging.info(f"Ready! Listening for '{self.args.wakeword}'...")
         self.audio.start()
-        
-        # Track wake word scores for debugging
-        score_history = []
-        # Track time-weighted moving average for more stable detection
-        weighted_scores = []
-        
+
         try:
-            while True:
-                if self.is_handling_conversation:
-                    time.sleep(0.01)
-                    continue
-                # 1. Get audio for Wakeword Detection
-                chunk = self.audio.get_chunk()
-                if not chunk:
-                    time.sleep(0.001)
-                    continue
-
-                # 2. Check Wakeword with improved logic
-                int16_audio = np.frombuffer(chunk, dtype=np.int16)
-                prediction = self.oww_model.predict(int16_audio)
-                score = prediction.get(self.wakeword_key, 0)
-                
-                # Track scores for debugging (keep last 100)
-                score_history.append(score)
-                if len(score_history) > 100:
-                    score_history.pop(0)
-                
-                current_time = time.time()
-                
-                # IMPROVEMENT: Add score to weighted history (last 5 scores)
-                weighted_scores.append(score)
-                if len(weighted_scores) > 5:
-                    weighted_scores.pop(0)
-                
-                # Calculate moving average for more stable detection
-                avg_score = sum(weighted_scores) / len(weighted_scores)
-                
-                # Enhanced wake word detection
-                if score > self.args.wakeword_threshold:
-                    # Check cooldown period to prevent rapid re-triggers
-                    if current_time - self.last_wakeword_time > self.wakeword_cooldown:
-                        # Require consistent detection to reduce false positives
-                        self.consecutive_detection_count += 1
-                        
-                        logging.debug(f"Wakeword candidate detected (score: {score:.2f}, avg: {avg_score:.2f}, consecutive: {self.consecutive_detection_count}/{self.required_consecutive})")
-                        
-                        # IMPROVEMENT: Require both high instant score AND good average
-                        if (self.consecutive_detection_count >= self.required_consecutive and 
-                            avg_score > self.args.wakeword_threshold * 0.85):
-                            
-                            # Log recent score history
-                            recent_scores = [f"{s:.2f}" for s in score_history[-10:]]
-                            logging.info(f"Wakeword detected! (score: {score:.2f}, avg: {avg_score:.2f}, recent: {', '.join(recent_scores)})")
-                            
-                            self.last_wakeword_time = current_time
-                            self.consecutive_detection_count = 0
-                            weighted_scores.clear()
-                            self.oww_model.reset()
-                            
-                            self.is_handling_conversation = True
-                            self._handle_conversation()
-                            
-                            # Clear score history after conversation
-                            score_history.clear()
-                            logging.info(f"Ready! Listening for '{self.args.wakeword}'...")
-                    else:
-                        time_since_last = current_time - self.last_wakeword_time
-                        logging.debug(f"Wakeword in cooldown period (score: {score:.2f}, time since last: {time_since_last:.2f}s)")
-                else:
-                    # Reset consecutive count if score drops below threshold
-                    if self.consecutive_detection_count > 0:
-                        logging.debug(f"Wakeword detection sequence broken (score: {score:.2f})")
-                        self.consecutive_detection_count = 0
-
+            if self.wakeword_mode == "stt":
+                self._run_stt_wakeword()
+            else:
+                self._run_model_wakeword()
         except KeyboardInterrupt:
             logging.info("Stopping...")
         self.cleanup()
+
+    def _run_stt_wakeword(self):
+        """STT 기반 웨이크워드 감지 루프.
+
+        VAD로 음성을 감지하면 짧게 녹음 → whisper로 인식 → 웨이크워드 매칭.
+        """
+        while True:
+            if self.is_handling_conversation:
+                time.sleep(0.01)
+                continue
+
+            # VAD로 짧은 음성 녹음 (웨이크워드 감지용, 최대 3초)
+            audio_np = self.audio.record_phrase(
+                self.interrupt_event,
+                timeout_seconds=self.args.listen_timeout,
+            )
+
+            if audio_np is None:
+                continue
+
+            # 너무 짧은 오디오 무시 (0.3초 미만)
+            duration = len(audio_np) / RATE
+            if duration < 0.3:
+                continue
+
+            # 빠른 STT 인식
+            user_text = self.transcriber.transcribe(audio_np)
+            del audio_np
+
+            if not user_text or not user_text.strip():
+                continue
+
+            user_text_lower = user_text.strip().lower()
+            logging.debug(f"STT 웨이크워드 감지: '{user_text_lower}'")
+
+            # 웨이크워드 매칭 (초성 유사도 기반)
+            if not self._is_wakeword_match(user_text.strip()):
+                logging.debug(f"웨이크워드 불일치: '{user_text_lower}'")
+                continue
+
+            current_time = time.time()
+            if current_time - self.last_wakeword_time < self.wakeword_cooldown:
+                continue
+
+            logging.info(f"웨이크워드 감지됨! (STT: '{user_text.strip()}')")
+            self.last_wakeword_time = current_time
+
+            # 웨이크워드 뒤에 명령어가 포함되어 있는지 확인
+            command_text = self._extract_command_after_wakeword(user_text.strip())
+
+            self.is_handling_conversation = True
+            if command_text:
+                logging.info(f"웨이크워드와 함께 명령 감지: '{command_text}'")
+                self._handle_conversation(prerecorded_text=command_text)
+            else:
+                self._handle_conversation()
+
+            # 연속 대화 모드: 대화 후 일정 시간 동안 웨이크워드 없이 계속 대화
+            follow_up_timeout = getattr(self.args, "follow_up_seconds", 10)
+            while follow_up_timeout > 0:
+                logging.info(f"연속 대화 대기 중... ({follow_up_timeout}초)")
+                self.audio.start()
+                follow_start = time.time()
+
+                audio_np = self.audio.record_phrase(
+                    self.interrupt_event,
+                    timeout_seconds=follow_up_timeout,
+                )
+
+                elapsed = time.time() - follow_start
+
+                if audio_np is None:
+                    # 타임아웃 - 아무 말 없으면 연속 대화 종료
+                    logging.debug("연속 대화 타임아웃, 대기 모드로 복귀")
+                    break
+
+                duration = len(audio_np) / RATE
+                if duration < 0.3:
+                    follow_up_timeout -= elapsed
+                    continue
+
+                # 추가 발화 감지 - 웨이크워드 없이 바로 대화 처리
+                user_text = self.transcriber.transcribe(audio_np)
+                del audio_np
+
+                if not user_text or not user_text.strip():
+                    follow_up_timeout -= elapsed
+                    continue
+
+                logging.info(f"연속 대화 감지: '{user_text.strip()}'")
+                self.audio.stop()
+                self._handle_conversation(prerecorded_text=user_text.strip())
+                # 연속 대화 타이머 리셋
+                follow_up_timeout = getattr(self.args, "follow_up_seconds", 10)
+
+            logging.info(f"Ready! Listening for '{self.args.wakeword}'...")
+
+    def _extract_command_after_wakeword(self, text: str) -> str:
+        """웨이크워드 뒤에 오는 명령어 텍스트를 추출.
+
+        한국어 웨이크워드 길이(3글자)만큼 건너뛰고 나머지를 반환한다.
+        쉼표, 마침표, 공백 등을 정리한다.
+        """
+        korean_chars = [(i, ch) for i, ch in enumerate(text) if 0xAC00 <= ord(ch) <= 0xD7A3]
+        ww_len = len(self.wakeword_text)
+
+        if len(korean_chars) <= ww_len:
+            return ""
+
+        # 웨이크워드 끝 위치 이후의 텍스트 추출
+        end_idx = korean_chars[ww_len - 1][0] + 1
+        remaining = text[end_idx:].lstrip(" ,.\t")
+
+        if len(remaining) > 2:
+            return remaining
+        return ""
+
+    def _run_model_wakeword(self):
+        """OpenWakeWord ONNX 모델 기반 웨이크워드 감지 루프."""
+        score_history = []
+        weighted_scores = []
+
+        while True:
+            if self.is_handling_conversation:
+                time.sleep(0.01)
+                continue
+
+            chunk = self.audio.get_chunk()
+            if not chunk:
+                time.sleep(0.001)
+                continue
+
+            int16_audio = np.frombuffer(chunk, dtype=np.int16)
+            prediction = self.oww_model.predict(int16_audio)
+            score = prediction.get(self.wakeword_key, 0)
+
+            score_history.append(score)
+            if len(score_history) > 100:
+                score_history.pop(0)
+
+            current_time = time.time()
+            weighted_scores.append(score)
+            if len(weighted_scores) > 5:
+                weighted_scores.pop(0)
+            avg_score = sum(weighted_scores) / len(weighted_scores)
+
+            if score > self.args.wakeword_threshold:
+                if current_time - self.last_wakeword_time > self.wakeword_cooldown:
+                    self.consecutive_detection_count += 1
+
+                    logging.debug(f"Wakeword candidate (score: {score:.2f}, consecutive: {self.consecutive_detection_count}/{self.required_consecutive})")
+
+                    if self.consecutive_detection_count >= self.required_consecutive:
+                        recent_scores = [f"{s:.2f}" for s in score_history[-10:]]
+                        logging.info(f"Wakeword detected! (score: {score:.2f}, recent: {', '.join(recent_scores)})")
+
+                        self.last_wakeword_time = current_time
+                        self.consecutive_detection_count = 0
+                        weighted_scores.clear()
+                        self.oww_model.reset()
+
+                        self.is_handling_conversation = True
+                        self._handle_conversation()
+
+                        self.oww_model.reset()
+                        self.consecutive_detection_count = 0
+                        weighted_scores.clear()
+                        score_history.clear()
+                        logging.info(f"Ready! Listening for '{self.args.wakeword}'...")
+            else:
+                if self.consecutive_detection_count > 0:
+                    self.consecutive_detection_count = 0
+
+    # 한국어 초성 테이블
+    _CHOSUNG = [
+        'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ',
+        'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ',
+    ]
+    # 유사 초성 그룹 (같은 그룹이면 매칭 허용)
+    # whisper가 한국어 자음을 혼동하는 패턴을 반영하여 넓게 설정
+    _SIMILAR_CHOSUNG = {
+        # 치경/경구개 그룹: ㅈ,ㅉ,ㅊ,ㅌ,ㄷ,ㄸ (whisper가 자주 혼동)
+        'ㅈ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        'ㅉ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        'ㅊ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        'ㅌ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        'ㄷ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        'ㄸ': {'ㅈ', 'ㅉ', 'ㅊ', 'ㅌ', 'ㄷ', 'ㄸ'},
+        # 양순음 그룹: ㅂ,ㅃ,ㅍ
+        'ㅂ': {'ㅂ', 'ㅃ', 'ㅍ'},
+        'ㅃ': {'ㅂ', 'ㅃ', 'ㅍ'},
+        'ㅍ': {'ㅂ', 'ㅃ', 'ㅍ'},
+        # 연구개음 그룹: ㄱ,ㄲ,ㅋ
+        'ㄱ': {'ㄱ', 'ㄲ', 'ㅋ'},
+        'ㄲ': {'ㄱ', 'ㄲ', 'ㅋ'},
+        'ㅋ': {'ㄱ', 'ㄲ', 'ㅋ'},
+        # 치찰음 그룹: ㅅ,ㅆ
+        'ㅅ': {'ㅅ', 'ㅆ'},
+        'ㅆ': {'ㅅ', 'ㅆ'},
+    }
+
+    def _extract_chosung(self, text: str) -> str:
+        """한국어 텍스트에서 초성만 추출. 비한글은 무시."""
+        result = []
+        for ch in text:
+            code = ord(ch) - 0xAC00
+            if 0 <= code < 11172:
+                result.append(self._CHOSUNG[code // 588])
+        return ''.join(result)
+
+    def _is_wakeword_match(self, text: str) -> bool:
+        """STT 인식 텍스트에서 웨이크워드를 유사도 기반으로 매칭.
+
+        3글자 한국어 단어의 초성을 비교하여 유사 발음을 허용한다.
+        예: "챱츄야" 초성 ㅊㅊㅇ ≈ "접추야" 초성 ㅈㅊㅇ (ㅈ≈ㅊ 유사)
+        """
+        text_lower = text.lower().strip()
+
+        # 영어 웨이크워드는 단순 포함 매칭
+        ww = self.wakeword_text.lower()
+        if not any(0xAC00 <= ord(c) <= 0xD7A3 for c in ww):
+            return ww in text_lower
+
+        # 한국어: 텍스트에서 단어 단위로 초성 비교
+        target_chosung = self.wakeword_chosung
+        target_len = len(target_chosung)
+
+        if target_len == 0:
+            return False
+
+        # 텍스트에서 한국어 글자만 추출하여 슬라이딩 윈도우 매칭
+        korean_chars = [ch for ch in text if 0xAC00 <= ord(ch) <= 0xD7A3]
+
+        for i in range(len(korean_chars) - len(self.wakeword_text) + 1):
+            window = korean_chars[i:i + len(self.wakeword_text)]
+            window_chosung = self._extract_chosung(''.join(window))
+
+            if len(window_chosung) != target_len:
+                continue
+
+            # 초성 유사도 비교: 모든 초성이 같거나 유사 그룹이어야 함
+            all_match = True
+            for c1, c2 in zip(target_chosung, window_chosung):
+                if c1 == c2:
+                    continue
+                similar = self._SIMILAR_CHOSUNG.get(c1, {c1})
+                if c2 not in similar:
+                    all_match = False
+                    break
+
+            if all_match:
+                logging.debug(f"초성 매칭 성공: '{self.wakeword_text}'({target_chosung}) ≈ '{''.join(window)}'({window_chosung})")
+                return True
+
+        return False
 
     def _process_plugins(self, text: str) -> str:
         """Processes simple plugins like [current time]."""
@@ -137,80 +339,75 @@ class VoiceAssistant:
             text = re.sub(r'\[current time\]', current_time, text, flags=re.IGNORECASE)
         return text
 
-    def _handle_conversation(self):
+    def _handle_conversation(self, prerecorded_text: str | None = None):
         try:
             conversation_start = time.time()
-            
+
             # Optional memory profiling
             mem_before = 0
             if self.args.debug and self.args.memory_profiling:
                 mem_before = monitor_memory()
                 logging.debug(f"Memory at conversation start: {mem_before:.2f} MB")
-    
+
             self.audio.stop()
             self.audio.clear_buffer()
-            
-            logging.debug("Playing acknowledgment")
-            self.tts.speak("Yes?")
-            self.tts.wait_until_done()
-            
-            self.interrupt_event.clear()
-            
-            # Start listening for command
-            logging.debug("Starting audio recording for command")
-            self.audio.start()
-            
-            # Longer delay to allow TTS audio to fade completely
-            time.sleep(0.4)
-            
-            recording_start = time.time()
-            audio_np = self.audio.record_phrase(self.interrupt_event, self.args.listen_timeout)
-            recording_duration = time.time() - recording_start
-            
-            # Stop listening and process
-            self.audio.stop()
-            
-            if audio_np is None:
-                logging.debug(f"No audio recorded (recording took {recording_duration:.2f}s)")
-                self.audio.start()
-                return
-    
-            logging.debug(f"Audio recording completed in {recording_duration:.2f}s")
-    
-            # IMPROVEMENT: More sophisticated audio quality validation
-            audio_rms = np.sqrt(np.mean(audio_np**2))
-            audio_peak = np.max(np.abs(audio_np))
-            audio_std = np.std(audio_np)
-            
-            logging.debug(f"Audio quality - RMS: {audio_rms:.4f}, Peak: {audio_peak:.4f}, StdDev: {audio_std:.4f}")
-            
-            # Check for multiple quality indicators
-            if audio_rms < 0.01:
-                logging.warning(f"Audio too quiet (RMS: {audio_rms:.4f}), proceeding to transcription")
-            
-            if audio_std < 0.005:
-                logging.warning(f"Audio lacks variation (StdDev: {audio_std:.4f}), likely silence, proceeding to transcription")
 
-            
-            # Check if audio is clipping (saturated)
-            if audio_peak > 0.98:
-                logging.warning(f"Audio may be clipping (Peak: {audio_peak:.4f})")
-                # Don't return - just warn, as clipped audio can still be transcribed
-    
-            # Transcribe with retry logic
-            transcription_start = time.time()
-            user_text = self._transcribe_with_retry(audio_np)
-            transcription_duration = time.time() - transcription_start
-            
-            logging.debug(f"Transcription completed in {transcription_duration:.2f}s")
-            
-            # Explicitly release audio data from memory
-            del audio_np
-            
-            if not user_text or not user_text.strip():
-                logging.debug("Transcription was empty or whitespace only")
+            # prerecorded_text가 있으면 녹음/인식 건너뛰기
+            if prerecorded_text:
+                user_text = prerecorded_text
+                self.interrupt_event.clear()
+                # "Yes?" 확인음 대신 바로 처리
+            else:
+                logging.debug("Playing acknowledgment")
+                self.tts.speak("네?")
+                self.tts.wait_until_done()
+
+                self.interrupt_event.clear()
+
+                # Start listening for command
+                logging.debug("Starting audio recording for command")
                 self.audio.start()
-                return
+
+            if not prerecorded_text:
+                # 녹음 및 인식 (prerecorded_text가 없을 때만)
+                time.sleep(0.4)
+
+                recording_start = time.time()
+                audio_np = self.audio.record_phrase(self.interrupt_event, self.args.listen_timeout)
+                recording_duration = time.time() - recording_start
+
+                self.audio.stop()
+
+                if audio_np is None:
+                    logging.debug(f"No audio recorded (recording took {recording_duration:.2f}s)")
+                    self.audio.start()
+                    return
+
+                logging.debug(f"Audio recording completed in {recording_duration:.2f}s")
+
+                audio_rms = np.sqrt(np.mean(audio_np**2))
+                audio_peak = np.max(np.abs(audio_np))
+                audio_std = np.std(audio_np)
+                logging.debug(f"Audio quality - RMS: {audio_rms:.4f}, Peak: {audio_peak:.4f}, StdDev: {audio_std:.4f}")
+
+                if audio_rms < 0.01:
+                    logging.warning(f"Audio too quiet (RMS: {audio_rms:.4f}), proceeding to transcription")
+                if audio_std < 0.005:
+                    logging.warning(f"Audio lacks variation (StdDev: {audio_std:.4f}), likely silence, proceeding to transcription")
+                if audio_peak > 0.98:
+                    logging.warning(f"Audio may be clipping (Peak: {audio_peak:.4f})")
+
+                transcription_start = time.time()
+                user_text = self._transcribe_with_retry(audio_np)
+                transcription_duration = time.time() - transcription_start
+                logging.debug(f"Transcription completed in {transcription_duration:.2f}s")
+
+                del audio_np
+
+                if not user_text or not user_text.strip():
+                    logging.debug("Transcription was empty or whitespace only")
+                    self.audio.start()
+                    return
     
             # Trim wake word if enabled
             original_text = user_text
@@ -255,39 +452,31 @@ class VoiceAssistant:
                 self.audio.start()
                 return
     
-            # Get LLM Response & Speak
+            # LLM 응답을 전체 수신 후 한 번에 TTS로 전달
             logging.debug("Sending to LLM")
             llm_start = time.time()
-            sentence_buffer = ""
+            full_response = ""
             token_count = 0
-            
+
             for token in self.llm.chat_stream(user_text):
-                if token is None: 
+                if token is None:
                     logging.error("LLM returned None token")
                     break
                 if self.interrupt_event.is_set():
                     logging.debug("Conversation interrupted")
-                    self.tts.clear_queue()
                     break
-                
+
                 token_count += 1
-                sentence_buffer += token
-                
-                # Stream sentences to TTS
-                if any(p in token for p in SENTENCE_END_PUNCTUATION):
-                    sentence = sentence_buffer.strip()
-                    if sentence:
-                        logging.debug(f"Queuing sentence for TTS: '{sentence[:50]}...'" )
-                        self.tts.speak(sentence)
-                    sentence_buffer = ""
-            
+                full_response += token
+
             llm_duration = time.time() - llm_start
             logging.debug(f"LLM streaming completed in {llm_duration:.2f}s ({token_count} tokens)")
-            
-            # Speak remaining buffer
-            if sentence_buffer.strip() and not self.interrupt_event.is_set():
-                logging.debug(f"Queuing final buffer for TTS: '{sentence_buffer.strip()}'")
-                self.tts.speak(sentence_buffer.strip())
+
+            # 전체 응답을 한 번에 TTS로 전달
+            full_response = full_response.strip()
+            if full_response and not self.interrupt_event.is_set():
+                logging.info(f"Assistant: {full_response}")
+                self.tts.speak(full_response)
             
             logging.debug("Waiting for TTS to complete")
             self.tts.wait_until_done()

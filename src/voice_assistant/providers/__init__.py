@@ -44,6 +44,27 @@ try:
 except ImportError as e:
     logging.debug(f"SupertonicProvider 등록 건너뜀 (의존성 미설치): {e}")
 
+# Grok TTS Provider 등록 (WebSocket 스트리밍)
+try:
+    from .grok_tts_provider import GrokTTSProvider
+    ProviderFactory.register_tts("grok", GrokTTSProvider)
+except ImportError as e:
+    logging.debug(f"GrokTTSProvider 등록 건너뜀 (의존성 미설치): {e}")
+
+# OpenAI TTS Provider 등록
+try:
+    from .openai_tts_provider import OpenAITTSProvider
+    ProviderFactory.register_tts("openai", OpenAITTSProvider)
+except ImportError as e:
+    logging.debug(f"OpenAITTSProvider 등록 건너뜀 (의존성 미설치): {e}")
+
+# Supertone Play API TTS Provider 등록
+try:
+    from .supertone_play_provider import SupertonePlayProvider
+    ProviderFactory.register_tts("supertone_play", SupertonePlayProvider)
+except ImportError as e:
+    logging.debug(f"SupertonePlayProvider 등록 건너뜀 (의존성 미설치): {e}")
+
 __all__ = [
     "LLMProvider",
     "TTSProvider",
