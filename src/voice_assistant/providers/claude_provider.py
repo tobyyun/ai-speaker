@@ -82,16 +82,27 @@ class ClaudeProvider(LLMProvider):
         # 히스토리 최대 쌍 수 (기존 LLMHandler 패턴 유지)
         self._max_pairs: int = getattr(config, "max_history_tokens", 2048) // 100
 
+        # 비서 이름을 시스템 프롬프트에 반영
+        from ..tools import load_state
+        state = load_state()
+        assistant_name = state.get("name", "챱츄")
+        self.system_prompt = (
+            f"당신의 이름은 '{assistant_name}'입니다. "
+            f"절대로 먼저 이름을 말하지 마세요. 사용자가 '이름이 뭐야?'라고 직접 물어볼 때만 이름을 답하세요. "
+            f"답변 시작할 때 자기소개, 인사, 이름 언급을 하지 마세요. 바로 본론만 말하세요. " +
+            self.system_prompt
+        )
+
         logging.info(
             f"Claude Provider 초기화 완료. 모델: {self._model}, "
-            f"최대 토큰: {self._max_tokens}"
+            f"최대 토큰: {self._max_tokens}, 비서 이름: {assistant_name}"
         )
 
     def chat_stream(self, user_text: str) -> Generator[str | None, None, None]:
         """사용자 입력에 대한 Claude 응답을 토큰 단위로 스트리밍.
 
-        Claude API의 messages.stream()을 사용하여 실시간으로 토큰을 전달한다.
-        system 프롬프트는 messages 리스트가 아닌 별도의 system 파라미터로 전달한다.
+        Tool Use를 지원하여 시간 조회, 웹 검색 등을 Claude가 자동으로 판단하여 호출한다.
+        도구 호출이 필요한 경우 도구를 실행하고 결과를 포함하여 최종 응답을 생성한다.
 
         Args:
             user_text: 사용자 입력 텍스트
@@ -100,14 +111,53 @@ class ClaudeProvider(LLMProvider):
             str | None: 응답 토큰 문자열, 오류 시 None
         """
         import anthropic
+        from ..tools import TOOLS, execute_tool
 
         # 사용자 메시지를 히스토리에 추가
         self.messages.append({"role": "user", "content": user_text})
         self._prune_history()
 
-        full_response = ""
         try:
-            # Claude API는 system 프롬프트를 별도 파라미터로 받음
+            # 1단계: 도구 사용 여부 판단 (non-streaming)
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=self.system_prompt,
+                messages=self.messages,
+                tools=TOOLS,
+            )
+
+            # 도구 호출이 없으면 바로 텍스트 반환
+            if response.stop_reason != "tool_use":
+                full_response = ""
+                for block in response.content:
+                    if block.type == "text":
+                        full_response += block.text
+                        yield block.text
+                self.messages.append({"role": "assistant", "content": full_response})
+                return
+
+            # 2단계: 도구 실행
+            # assistant 응답(tool_use 포함)을 히스토리에 추가
+            self.messages.append({"role": "assistant", "content": response.content})
+
+            # 각 도구 호출 실행
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    logging.info(f"도구 호출: {block.name}({block.input})")
+                    result = execute_tool(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+
+            # 도구 결과를 히스토리에 추가
+            self.messages.append({"role": "user", "content": tool_results})
+
+            # 3단계: 도구 결과를 포함하여 최종 응답 생성
+            full_response = ""
             with self._client.messages.stream(
                 model=self._model,
                 max_tokens=self._max_tokens,
@@ -118,14 +168,10 @@ class ClaudeProvider(LLMProvider):
                     full_response += text
                     yield text
 
-            # 완성된 응답을 히스토리에 추가
             self.messages.append({"role": "assistant", "content": full_response})
 
         except anthropic.AuthenticationError:
-            logging.error(
-                "Claude API 인증 실패. ANTHROPIC_API_KEY를 확인해주세요."
-            )
-            # 실패한 사용자 메시지 롤백
+            logging.error("Claude API 인증 실패. ANTHROPIC_API_KEY를 확인해주세요.")
             if self.messages and self.messages[-1]["role"] == "user":
                 self.messages.pop()
             yield None

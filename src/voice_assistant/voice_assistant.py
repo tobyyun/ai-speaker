@@ -2,6 +2,7 @@ import logging
 import threading
 import time
 import numpy as np
+import sounddevice as sd
 import os
 import gc
 import re
@@ -10,6 +11,7 @@ import re
 from .audio_input import AudioInput
 from .providers import ProviderFactory
 from .audio_utils import SENTENCE_END_PUNCTUATION, RATE, INT16_MAX, monitor_memory
+from .tools import load_state, set_name_changed_callback
 
 class VoiceAssistant:
     def __init__(self, args, client=None):
@@ -26,11 +28,21 @@ class VoiceAssistant:
 
         # 웨이크워드 모드: "model" (OpenWakeWord ONNX) 또는 "stt" (STT 기반)
         self.wakeword_mode = getattr(args, "wakeword_mode", "model")
-        # STT 모드에서 매칭할 웨이크워드
-        self.wakeword_text = getattr(args, "wakeword", "hey jarvis").strip()
+
+        # 상태 파일에서 이름/웨이크워드 로드 (사용자가 이름을 바꿨을 수 있음)
+        state = load_state()
+        saved_wakeword = state.get("wakeword", "")
+        if saved_wakeword:
+            self.wakeword_text = saved_wakeword
+        else:
+            self.wakeword_text = getattr(args, "wakeword", "hey jarvis").strip()
+        self.assistant_name = state.get("name", "챱츄")
         self.wakeword_chosung = self._extract_chosung(self.wakeword_text)
 
-        logging.debug(f"VoiceAssistant init - wakeword_mode: {self.wakeword_mode}, wakeword: '{self.wakeword_text}', chosung: '{self.wakeword_chosung}'")
+        # 이름 변경 콜백 등록 (도구에서 이름 변경 시 런타임 업데이트)
+        set_name_changed_callback(self._on_name_changed)
+
+        logging.debug(f"VoiceAssistant init - wakeword_mode: {self.wakeword_mode}, name: '{self.assistant_name}', wakeword: '{self.wakeword_text}', chosung: '{self.wakeword_chosung}'")
 
         # 서브시스템 초기화 (Provider 팩토리를 통해 생성)
         self.audio = AudioInput(args)
@@ -314,21 +326,182 @@ class VoiceAssistant:
             if len(window_chosung) != target_len:
                 continue
 
-            # 초성 유사도 비교: 모든 초성이 같거나 유사 그룹이어야 함
-            all_match = True
+            # 초성 유사도 비교: 유사 그룹 불일치 1개까지 허용 (관대 설정)
+            mismatch = 0
             for c1, c2 in zip(target_chosung, window_chosung):
                 if c1 == c2:
                     continue
                 similar = self._SIMILAR_CHOSUNG.get(c1, {c1})
-                if c2 not in similar:
-                    all_match = False
-                    break
+                if c2 in similar:
+                    continue  # 유사 그룹이면 OK
+                mismatch += 1
 
-            if all_match:
-                logging.debug(f"초성 매칭 성공: '{self.wakeword_text}'({target_chosung}) ≈ '{''.join(window)}'({window_chosung})")
+            # 마지막 글자(야)는 ㅇ이어야 함 (기본 필터)
+            last_ok = target_chosung[-1] == window_chosung[-1] if target_len > 0 else True
+
+            if mismatch <= 1 and last_ok:
+                logging.debug(
+                    f"초성 매칭 성공: '{self.wakeword_text}'({target_chosung}) ≈ "
+                    f"'{''.join(window)}'({window_chosung}) [불일치:{mismatch}]"
+                )
                 return True
 
         return False
+
+    def _start_thinking_sound(self) -> None:
+        """Thinking 사운드를 백그라운드에서 루프 재생."""
+        thinking_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "assets", "thinking.mp3"
+        )
+        if not os.path.exists(thinking_path):
+            logging.debug(f"Thinking 사운드 파일 없음: {thinking_path}")
+            return
+
+        self._thinking_stop = threading.Event()
+
+        def _play_loop():
+            try:
+                import soundfile as sf
+                data, samplerate = sf.read(thinking_path, dtype="int16")
+
+                # 스테레오면 모노로 변환
+                if len(data.shape) > 1:
+                    data = data.mean(axis=1).astype(np.int16)
+
+                output_device = getattr(self.args, "piper_output_device_index", None)
+                chunk_size = samplerate // 10  # 100ms
+
+                # 스트림을 한 번만 열고 루프 재생
+                with sd.OutputStream(
+                    samplerate=samplerate,
+                    device=output_device,
+                    channels=1,
+                    dtype="int16",
+                ) as stream:
+                    while not self._thinking_stop.is_set():
+                        for i in range(0, len(data), chunk_size):
+                            if self._thinking_stop.is_set():
+                                return
+                            stream.write(data[i:i + chunk_size])
+
+            except Exception as e:
+                logging.debug(f"Thinking 사운드 재생 오류: {e}")
+
+        self._thinking_thread = threading.Thread(target=_play_loop, daemon=True)
+        self._thinking_thread.start()
+        logging.debug("Thinking 사운드 시작")
+
+    def _stop_thinking_sound(self) -> None:
+        """Thinking 사운드 정지."""
+        if hasattr(self, "_thinking_stop") and self._thinking_stop:
+            self._thinking_stop.set()
+        if hasattr(self, "_thinking_thread") and self._thinking_thread:
+            self._thinking_thread.join(timeout=2.0)
+            self._thinking_thread = None
+        logging.debug("Thinking 사운드 정지")
+
+    def _on_name_changed(self, new_name: str, new_wakeword: str) -> None:
+        """이름 변경 콜백. 도구에서 이름 변경 시 런타임으로 웨이크워드 업데이트."""
+        self.assistant_name = new_name
+        self.wakeword_text = new_wakeword
+        self.wakeword_chosung = self._extract_chosung(new_wakeword)
+        logging.info(
+            f"웨이크워드 런타임 업데이트: '{new_wakeword}' (초성: {self.wakeword_chosung})"
+        )
+
+    def _monitor_barge_in(self) -> str | None:
+        """TTS 재생 중 사용자 음성을 감지하여 바지인 처리.
+
+        TTS가 재생되는 동안 마이크를 모니터링하고,
+        VAD가 일정 시간 이상 음성을 감지하면 TTS를 중단하고
+        사용자의 발화를 녹음/인식한다.
+
+        Returns:
+            사용자 발화 텍스트, 또는 바지인 없이 TTS 완료 시 None
+        """
+        import webrtcvad
+
+        self.audio.start()
+        vad = webrtcvad.Vad(0)  # 가장 낮은 공격성
+        speech_chunks = 0
+        required_speech_chunks = 40  # ~1.2초 연속 음성 감지 시 바지인
+        barge_in_delay = 3.0  # TTS 시작 후 이 시간(초)은 바지인 무시
+        energy_threshold = 0.03  # 스피커 에코보다 높은 에너지만 감지
+        monitor_start = time.time()
+
+        # 처음 N초간은 에코 에너지 기준선 측정
+        echo_energy_samples = []
+
+        while self.tts.is_speaking:
+            chunk = self.audio.get_chunk(timeout=0.03)
+            if not chunk:
+                continue
+
+            elapsed = time.time() - monitor_start
+
+            # 오디오 에너지 계산
+            audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / INT16_MAX
+            chunk_energy = np.sqrt(np.mean(audio_data ** 2))
+
+            # 처음 2초간 에코 에너지 기준선 수집
+            if elapsed < 2.0:
+                echo_energy_samples.append(chunk_energy)
+                continue
+
+            # 에코 기준선 계산 (평균 + 여유분)
+            if echo_energy_samples:
+                echo_baseline = (sum(echo_energy_samples) / len(echo_energy_samples)) * 2.0
+                echo_energy_samples = []  # 한 번만 계산
+            elif not hasattr(self, '_echo_baseline'):
+                echo_baseline = energy_threshold
+            else:
+                echo_baseline = self._echo_baseline
+            self._echo_baseline = echo_baseline
+
+            # 바지인 지연 시간 내에는 무시
+            if elapsed < barge_in_delay:
+                continue
+
+            try:
+                is_speech = vad.is_speech(chunk, RATE)
+            except Exception:
+                continue
+
+            # VAD + 에너지 임계값 둘 다 통과해야 함
+            if is_speech and chunk_energy > max(echo_baseline, energy_threshold):
+                speech_chunks += 1
+                if speech_chunks >= required_speech_chunks:
+                    logging.info(
+                        f"바지인 감지! (에너지: {chunk_energy:.4f}, "
+                        f"기준: {echo_baseline:.4f}, 경과: {elapsed:.1f}초)"
+                    )
+                    self.interrupt_event.set()
+                    self.tts.clear_queue()
+
+                    time.sleep(0.2)
+                    self.interrupt_event.clear()
+
+                    # 사용자 발화 녹음
+                    audio_np = self.audio.record_phrase(
+                        self.interrupt_event, self.args.listen_timeout
+                    )
+                    self.audio.stop()
+
+                    if audio_np is None or len(audio_np) / RATE < 0.3:
+                        return None
+
+                    user_text = self.transcriber.transcribe(audio_np)
+                    del audio_np
+
+                    if user_text and user_text.strip():
+                        return user_text.strip()
+                    return None
+            else:
+                speech_chunks = max(0, speech_chunks - 2)
+
+        self.audio.stop()
+        return None
 
     def _process_plugins(self, text: str) -> str:
         """Processes simple plugins like [current time]."""
@@ -452,6 +625,9 @@ class VoiceAssistant:
                 self.audio.start()
                 return
     
+            # Thinking 사운드 루프 재생 시작
+            self._start_thinking_sound()
+
             # LLM 응답을 전체 수신 후 한 번에 TTS로 전달
             logging.debug("Sending to LLM")
             llm_start = time.time()
@@ -469,18 +645,26 @@ class VoiceAssistant:
                 token_count += 1
                 full_response += token
 
+            # Thinking 사운드 정지
+            self._stop_thinking_sound()
+
             llm_duration = time.time() - llm_start
             logging.debug(f"LLM streaming completed in {llm_duration:.2f}s ({token_count} tokens)")
 
             # 전체 응답을 한 번에 TTS로 전달
             full_response = full_response.strip()
+            barge_in_text = None
             if full_response and not self.interrupt_event.is_set():
                 logging.info(f"Assistant: {full_response}")
                 self.tts.speak(full_response)
-            
-            logging.debug("Waiting for TTS to complete")
-            self.tts.wait_until_done()
-            
+
+                # 바지인 감지: TTS 재생 중 마이크로 사용자 음성을 모니터링
+                barge_in_text = self._monitor_barge_in()
+
+            if barge_in_text is None:
+                # 바지인 없이 정상 완료 - TTS 끝날 때까지 대기
+                self.tts.wait_until_done()
+
             # After conversation completes
             self.conversation_count += 1
             conversation_duration = time.time() - conversation_start
@@ -499,6 +683,11 @@ class VoiceAssistant:
                 logging.debug(f"Memory at conversation end: {mem_after:.2f} MB (delta: {mem_delta:+.2f} MB)")
                 
             self.audio.start()
+
+            # 바지인으로 중단된 경우 즉시 새 대화 시작
+            if barge_in_text:
+                logging.info(f"바지인 대화: '{barge_in_text}'")
+                self._handle_conversation(prerecorded_text=barge_in_text)
         finally:
             self.is_handling_conversation = False
 
